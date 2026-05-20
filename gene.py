@@ -3,6 +3,7 @@ import argparse
 from queue import PriorityQueue
 import json
 import math
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 import random
 import yaml
@@ -15,7 +16,7 @@ from haversine import haversine, haversine_vector
 import torch
 import torch.nn.functional as F
 
-from utils import set_seed, create_nested_namespace, get_angle
+from utils import set_seed, create_nested_namespace, get_angle, resolve_device
 from models.hoser import HOSER
 
 
@@ -39,7 +40,7 @@ class SearchNode:
 
 
 class Searcher:
-    def __init__(self, model, reachable_road_id_dict, geo, road_center_gps, timestamp_label_array_log1p_mean, timestamp_label_array_log1p_std, device):
+    def __init__(self, model, reachable_road_id_dict, geo, road_center_gps, timestamp_label_array_log1p_mean, timestamp_label_array_log1p_std, device, use_amp):
         self.model = model.to(device)
         self.model.eval()
 
@@ -49,9 +50,10 @@ class Searcher:
         self.timestamp_label_array_log1p_mean = timestamp_label_array_log1p_mean
         self.timestamp_label_array_log1p_std = timestamp_label_array_log1p_std
         self.device = device
+        self.amp_context = torch.cuda.amp.autocast if use_amp else nullcontext
 
         with torch.no_grad():
-            with torch.cuda.amp.autocast():
+            with self.amp_context():
                 model.setup_road_network_features()
 
     def search(self, origin_road_id, origin_datetime, destination_road_id, max_search_step=5000):
@@ -122,7 +124,7 @@ class Searcher:
             batch_metric_dis = torch.from_numpy(np.array([metric_dis])).to(self.device)
             batch_metric_angle = torch.from_numpy(np.array([metric_angle])).to(self.device)
 
-            with torch.cuda.amp.autocast():
+            with self.amp_context():
                 logits, time_pred = self.model.infer(batch_trace_road_id, batch_temporal_info, batch_trace_distance_mat, batch_trace_time_interval_mat, batch_trace_len, batch_destination_road_id, batch_candidate_road_id, batch_metric_dis, batch_metric_angle)
 
             logits = logits[0]
@@ -154,9 +156,9 @@ class Searcher:
         return best_trace[0], best_trace[1]
 
 
-def init_searcher(model, reachable_road_id_dict, geo, road_center_gps, timestamp_label_array_log1p_mean, timestamp_label_array_log1p_std, device):
+def init_searcher(model, reachable_road_id_dict, geo, road_center_gps, timestamp_label_array_log1p_mean, timestamp_label_array_log1p_std, device, use_amp):
     global searcher
-    searcher = Searcher(model, reachable_road_id_dict, geo, road_center_gps, timestamp_label_array_log1p_mean, timestamp_label_array_log1p_std, device)
+    searcher = Searcher(model, reachable_road_id_dict, geo, road_center_gps, timestamp_label_array_log1p_mean, timestamp_label_array_log1p_std, device, use_amp)
 
 def process_task(args):
     (origin_road_id, destination_road_id), origin_datetime = args
@@ -169,12 +171,14 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', type=str)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--cuda', type=int, default=0)
+    parser.add_argument('--device', type=str, default=None)
     parser.add_argument('--num_gene', type=int, default=5000)
     parser.add_argument('--processes', type=int, default=8)
     args = parser.parse_args()
 
     set_seed(args.seed)
-    device = f'cuda:{args.cuda}'
+    device = resolve_device(args.device, args.cuda)
+    use_amp = device.type == 'cuda'
 
     # Prepare model config and related features
 
@@ -366,7 +370,7 @@ if __name__ == '__main__':
     gene_trace_datetime = [None] * args.num_gene
 
     torch.multiprocessing.set_start_method('spawn', force=True)
-    initargs = (model, reachable_road_id_dict, geo, road_center_gps, timestamp_label_array_log1p_mean, timestamp_label_array_log1p_std, device)
+    initargs = (model, reachable_road_id_dict, geo, road_center_gps, timestamp_label_array_log1p_mean, timestamp_label_array_log1p_std, device, use_amp)
     with torch.multiprocessing.Pool(processes=args.processes, initializer=init_searcher, initargs=initargs) as pool:
         tasks = zip(od_coords, origin_datetime_list)
         results = list(tqdm(pool.imap(process_task, tasks), total=len(od_coords), desc='Generating trajectories'))

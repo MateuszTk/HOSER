@@ -4,7 +4,7 @@ import pandas as pd
 
 
 if __name__ == '__main__':
-    for dataset in ['Beijing', 'Porto', 'San_Francisco']:
+    for dataset in ['San_Francisco']: #'Beijing', 'Porto', 
         print(f'Processing {dataset} dataset')
 
         road2zone = []

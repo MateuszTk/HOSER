@@ -10,6 +10,12 @@ def set_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
 
+
+def resolve_device(device_arg=None, cuda_index=0):
+    requested_device = device_arg or f'cuda:{cuda_index}'
+    device = torch.device(requested_device)
+    return device
+
 def create_nested_namespace(data):
     if isinstance(data, dict):
         return SimpleNamespace(**{k: create_nested_namespace(v) for k, v in data.items()})

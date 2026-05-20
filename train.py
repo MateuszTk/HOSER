@@ -1,7 +1,9 @@
+import gc
 import os
 import argparse
 import json
 import math
+from contextlib import nullcontext
 from datetime import datetime
 import yaml
 from tqdm import tqdm
@@ -16,7 +18,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from loguru import logger
 
-from utils import set_seed, create_nested_namespace, get_angle
+from utils import set_seed, create_nested_namespace, get_angle, resolve_device
 from models.hoser import HOSER
 from dataset import Dataset
 
@@ -41,18 +43,18 @@ class MyCollateFn:
         batch_timestamp_label = []
 
         for trace_road_id, temporal_info, trace_distance_mat, trace_time_interval_mat, trace_len, destination_road_id, candidate_road_id, metric_dis, metric_angle, candidate_len, road_label, timestamp_label in items:
-            batch_trace_road_id.append(trace_road_id)
-            batch_temporal_info.append(temporal_info)
-            batch_trace_distance_mat.append(trace_distance_mat)
-            batch_trace_time_interval_mat.append(trace_time_interval_mat)
+            batch_trace_road_id.append(np.array(trace_road_id, copy=True))
+            batch_temporal_info.append(np.array(temporal_info, copy=True))
+            batch_trace_distance_mat.append(np.array(trace_distance_mat, copy=True))
+            batch_trace_time_interval_mat.append(np.array(trace_time_interval_mat, copy=True))
             batch_trace_len.append(trace_len)
             batch_destination_road_id.append(destination_road_id)
-            batch_candidate_road_id.append(candidate_road_id)
-            batch_metric_dis.append(metric_dis)
-            batch_metric_angle.append(metric_angle)
-            batch_candidate_len.append(candidate_len)
-            batch_road_label.append(road_label)
-            batch_timestamp_label.append(timestamp_label)
+            batch_candidate_road_id.append([np.array(candidate, copy=True) for candidate in candidate_road_id])
+            batch_metric_dis.append([np.array(distance, copy=True) for distance in metric_dis])
+            batch_metric_angle.append([np.array(angle, copy=True) for angle in metric_angle])
+            batch_candidate_len.append(np.array(candidate_len, copy=True))
+            batch_road_label.append(np.array(road_label, copy=True))
+            batch_timestamp_label.append(np.array(timestamp_label, copy=True))
 
         max_trace_len = max(batch_trace_len)
         max_candidate_len = max([max(x) for x in batch_candidate_len])
@@ -103,10 +105,14 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', type=str)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--cuda', type=int, default=0)
+    parser.add_argument('--device', type=str, default=None)
+    parser.add_argument('--resume', type=str, default=None) # path to checkpoint file
     args = parser.parse_args()
 
     set_seed(args.seed)
-    device = f'cuda:{args.cuda}'
+    device = resolve_device(args.device, args.cuda)
+    use_amp = device.type == 'cuda'
+    amp_context = (lambda: torch.amp.autocast(device_type=device.type)) if use_amp else nullcontext
 
     # Prepare model config and related features
 
@@ -131,6 +137,7 @@ if __name__ == '__main__':
     writer = SummaryWriter(tensorboard_log_dir)
     os.makedirs(loguru_log_dir, exist_ok=True)
     logger.add(os.path.join(loguru_log_dir, f'{datetime.now().strftime("%Y-%m-%d-%H-%M-%S")}.log'), level="INFO", format="{time:YYYY-MM-DD HH:mm:ss} | {message}")
+    logger.info(f'using device {device}')
 
     geo = pd.read_csv(geo_file)
     rel = pd.read_csv(rel_file)
@@ -219,6 +226,9 @@ if __name__ == '__main__':
         np.array(adj_reachability).astype(np.float32),
     ], axis=1)
 
+    del adj_row, adj_col, adj_angle, adj_reachability
+    del road_adj, coord2road_id, reachable_road_id_dict
+
     zone_trans_mat = np.load(zone_trans_mat_file)
     zone_edge_index = np.stack(zone_trans_mat.nonzero())
 
@@ -226,6 +236,8 @@ if __name__ == '__main__':
     D_inv_sqrt = 1.0 / np.sqrt(np.maximum(np.sum(zone_trans_mat, axis=1), 1.0))
     zone_trans_mat_norm = zone_trans_mat * D_inv_sqrt[:, np.newaxis] * D_inv_sqrt[np.newaxis, :]
     zone_edge_weight = zone_trans_mat_norm[zone_edge_index[0], zone_edge_index[1]]
+
+    del zone_trans_mat, zone_trans_mat_norm, D_inv_sqrt
 
     config.road_network_encoder_config.road_id_num_embeddings = num_roads
     config.road_network_encoder_config.type_num_embeddings = len(np.unique(road_attr_type))
@@ -238,6 +250,10 @@ if __name__ == '__main__':
     config.road_network_encoder_feature.zone_edge_index = zone_edge_index
     config.road_network_encoder_feature.zone_edge_weight = zone_edge_weight
 
+    del road_attr_len, road_attr_type, road_attr_lon, road_attr_lat
+    del road_edge_index, intersection_attr, zone_edge_index, zone_edge_weight
+    del geo, rel, le
+
     road2zone = []
     with open(road_network_partition_file, 'r') as file:
         for line in file:
@@ -248,7 +264,6 @@ if __name__ == '__main__':
 
     train_dataset = Dataset(geo_file, rel_file, train_traj_file)
     val_dataset = Dataset(geo_file, rel_file, val_traj_file)
-    test_dataset = Dataset(geo_file, rel_file, test_traj_file)
 
     timestamp_label_array = []
     for item in train_dataset:
@@ -256,6 +271,10 @@ if __name__ == '__main__':
     timestamp_label_array = np.array(timestamp_label_array)
     timestamp_label_array_log1p_mean = np.log1p(timestamp_label_array).mean()
     timestamp_label_array_log1p_std = np.log1p(timestamp_label_array).std()
+
+    del timestamp_label_array
+    gc.collect()
+
 
     logger.info(f'timestamp_label_array_log1p_mean {timestamp_label_array_log1p_mean:.3f}')
     logger.info(f'timestamp_label_array_log1p_std {timestamp_label_array_log1p_std:.3f}')
@@ -265,24 +284,16 @@ if __name__ == '__main__':
         config.optimizer_config.batch_size,
         shuffle=True,
         collate_fn=MyCollateFn(timestamp_label_array_log1p_mean, timestamp_label_array_log1p_std),
-        num_workers=4,
-        pin_memory=True,
+        num_workers=0,
+        pin_memory=use_amp,
     )
     val_dataloader = DataLoader(
         val_dataset,
         config.optimizer_config.batch_size,
         shuffle=False,
         collate_fn=MyCollateFn(timestamp_label_array_log1p_mean, timestamp_label_array_log1p_std),
-        num_workers=4,
-        pin_memory=True,
-    )
-    test_dataloader = DataLoader(
-        test_dataset,
-        config.optimizer_config.batch_size,
-        shuffle=False,
-        collate_fn=MyCollateFn(timestamp_label_array_log1p_mean, timestamp_label_array_log1p_std),
-        num_workers=4,
-        pin_memory=True,
+        num_workers=0,
+        pin_memory=use_amp,
     )
 
     # Start training
@@ -301,14 +312,26 @@ if __name__ == '__main__':
     logger.info(f'config.navigator_config {config.navigator_config}')
     logger.info(f'road2zone {road2zone}')
 
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.optimizer_config.learning_rate, weight_decay=config.optimizer_config.weight_decay)
 
     metrics_list = []
+    start_epoch = 0
+
+    if args.resume:
+        logger.info(f'resuming from checkpoint {args.resume}')
+        checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        start_epoch = checkpoint['epoch']
+        metrics_list = checkpoint['metrics_list']
+        logger.info(f'resumed after epoch {start_epoch}')
+        del checkpoint
 
     total_iters = config.optimizer_config.max_epoch * len(train_dataloader)
     warmup_iters = config.optimizer_config.max_epoch * len(train_dataloader) * config.optimizer_config.warmup_ratio
-    iter_num = 0
+    iter_num = start_epoch * len(train_dataloader)
     def get_lr(it):
         if it < warmup_iters:
             return config.optimizer_config.learning_rate * it / warmup_iters
@@ -318,10 +341,10 @@ if __name__ == '__main__':
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
         return coeff * config.optimizer_config.learning_rate
 
-    for epoch_id in range(config.optimizer_config.max_epoch):
+    for epoch_id in range(start_epoch, config.optimizer_config.max_epoch):
         model.train()
         for batch_id, (batch_trace_road_id, batch_temporal_info, batch_trace_distance_mat, batch_trace_time_interval_mat, batch_trace_len, batch_destination_road_id, batch_candidate_road_id, batch_metric_dis, batch_metric_angle, batch_candidate_len, batch_road_label, batch_timestamp_label) in enumerate(tqdm(train_dataloader, desc=f'[training] epoch{epoch_id+1}')):
-            with torch.cuda.amp.autocast():
+            with amp_context():
                 model.setup_road_network_features()
 
             batch_trace_road_id = batch_trace_road_id.to(device)
@@ -344,7 +367,7 @@ if __name__ == '__main__':
 
             optimizer.zero_grad()
 
-            with torch.cuda.amp.autocast():
+            with amp_context():
                 logits, time_pred = model(batch_trace_road_id, batch_temporal_info, batch_trace_distance_mat, batch_trace_time_interval_mat, batch_trace_len, batch_destination_road_id, batch_candidate_road_id, batch_metric_dis, batch_metric_angle)
 
                 logits_mask = torch.arange(logits.size(1), dtype=torch.int64, device=device).unsqueeze(0) < batch_trace_len.unsqueeze(1)
@@ -372,16 +395,18 @@ if __name__ == '__main__':
             scaler.step(optimizer)
             scaler.update()
 
-            writer.add_scalar('loss_next_step', loss_next_step.item(), len(train_dataloader) * epoch_id + batch_id)
-            writer.add_scalar('loss_time_pred', loss_time_pred.item(), len(train_dataloader) * epoch_id + batch_id)
-            writer.add_scalar('loss', loss.item(), len(train_dataloader) * epoch_id + batch_id)
-            writer.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], len(train_dataloader) * epoch_id + batch_id)
+            step = len(train_dataloader) * epoch_id + batch_id
+            writer.add_scalar('loss_next_step', loss_next_step.item(), step)
+            writer.add_scalar('loss_time_pred', loss_time_pred.item(), step)
+            writer.add_scalar('loss', loss.item(), step)
+            writer.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], step)
 
         logger.info(f'[training] epoch{epoch_id+1}, loss_next_step {loss_next_step.item():.3f}, loss_time_pred {loss_time_pred.item():.3f}')
+        writer.flush()
 
         model.eval()
         with torch.no_grad():
-            with torch.cuda.amp.autocast():
+            with amp_context():
                 model.setup_road_network_features()
 
         val_next_step_correct_cnt, val_next_step_total_cnt = 0, 0
@@ -402,7 +427,7 @@ if __name__ == '__main__':
             batch_timestamp_label = batch_timestamp_label.to(device)
 
             with torch.no_grad():
-                with torch.cuda.amp.autocast():
+                with amp_context():
                     logits, time_pred = model(batch_trace_road_id, batch_temporal_info, batch_trace_distance_mat, batch_trace_time_interval_mat, batch_trace_len, batch_destination_road_id, batch_candidate_road_id, batch_metric_dis, batch_metric_angle)
 
                     logits_mask = torch.arange(logits.size(1), dtype=torch.int64, device=device).unsqueeze(0) < batch_trace_len.unsqueeze(1)
@@ -430,19 +455,43 @@ if __name__ == '__main__':
         metrics_list.append(val_next_step_correct_cnt/val_next_step_total_cnt)
 
         torch.save(model.state_dict(), os.path.join(save_dir, f'epoch_{epoch_id+1}.pth'))
+        torch.save({
+            'epoch': epoch_id + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
+            'metrics_list': metrics_list,
+        }, os.path.join(save_dir, f'checkpoint_epoch_{epoch_id+1}.pth'))
 
     best_epoch = np.argmax(metrics_list)
     logger.info(f'loading epoch_{best_epoch+1}.pth')
+
+    del train_dataset, train_dataloader, val_dataset, val_dataloader
+    del scaler, optimizer
+    gc.collect()
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+
     best_model_state_dict = torch.load(os.path.join(save_dir, f'epoch_{best_epoch+1}.pth'), map_location=device)
     model.load_state_dict(best_model_state_dict)
 
     model.eval()
     with torch.no_grad():
-        with torch.cuda.amp.autocast():
+        with amp_context():
             model.setup_road_network_features()
 
     test_next_step_correct_cnt, test_next_step_total_cnt = 0, 0
     test_time_pred_mape_sum, test_time_pred_total_cnt = 0, 0
+
+    test_dataset = Dataset(geo_file, rel_file, test_traj_file)
+    test_dataloader = DataLoader(
+        test_dataset,
+        config.optimizer_config.batch_size,
+        shuffle=False,
+        collate_fn=MyCollateFn(timestamp_label_array_log1p_mean, timestamp_label_array_log1p_std),
+        num_workers=0,
+        pin_memory=use_amp,
+    )
 
     for batch_id, (batch_trace_road_id, batch_temporal_info, batch_trace_distance_mat, batch_trace_time_interval_mat, batch_trace_len, batch_destination_road_id, batch_candidate_road_id, batch_metric_dis, batch_metric_angle, batch_candidate_len, batch_road_label, batch_timestamp_label) in enumerate(tqdm(test_dataloader, desc=f'[testing]')):
         batch_trace_road_id = batch_trace_road_id.to(device)
@@ -459,7 +508,7 @@ if __name__ == '__main__':
         batch_timestamp_label = batch_timestamp_label.to(device)
 
         with torch.no_grad():
-            with torch.cuda.amp.autocast():
+            with amp_context():
                 logits, time_pred = model(batch_trace_road_id, batch_temporal_info, batch_trace_distance_mat, batch_trace_time_interval_mat, batch_trace_len, batch_destination_road_id, batch_candidate_road_id, batch_metric_dis, batch_metric_angle)
 
                 logits_mask = torch.arange(logits.size(1), dtype=torch.int64, device=device).unsqueeze(0) < batch_trace_len.unsqueeze(1)

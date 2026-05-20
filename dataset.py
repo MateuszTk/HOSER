@@ -1,5 +1,8 @@
+import hashlib
 import math
 import multiprocessing
+import os
+import pickle
 from datetime import datetime
 from tqdm import tqdm
 import numpy as np
@@ -79,7 +82,28 @@ def process_row(args):
 
 
 class Dataset(torch.utils.data.Dataset):
-    def __init__(self, geo_file, rel_file, traj_file):
+    def __init__(self, geo_file, rel_file, traj_file, cache_dir=None):
+        cache_path = self._get_cache_path(geo_file, rel_file, traj_file, cache_dir)
+
+        if cache_path and os.path.exists(cache_path):
+            print(f'loading cached dataset from {cache_path}')
+            with open(cache_path, 'rb') as f:
+                cached = pickle.load(f)
+            self.trace_road_id = cached['trace_road_id']
+            self.temporal_info = cached['temporal_info']
+            self.trace_distance_mat = cached['trace_distance_mat']
+            self.trace_time_interval_mat = cached['trace_time_interval_mat']
+            self.trace_len = cached['trace_len']
+            self.destination_road_id = cached['destination_road_id']
+            self.candidate_road_id = cached['candidate_road_id']
+            self.metric_dis = cached['metric_dis']
+            self.metric_angle = cached['metric_angle']
+            self.candidate_len = cached['candidate_len']
+            self.road_label = cached['road_label']
+            self.timestamp_label = cached['timestamp_label']
+            del cached
+            return
+
         geo = pd.read_csv(geo_file)
         rel = pd.read_csv(rel_file)
         traj = pd.read_csv(traj_file)
@@ -130,6 +154,37 @@ class Dataset(torch.utils.data.Dataset):
             self.candidate_len[i] = data['candidate_len']
             self.road_label[i] = data['road_label']
             self.timestamp_label[i] = data['timestamp_label']
+
+        del results
+
+        if cache_path:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            with open(cache_path, 'wb') as f:
+                pickle.dump({
+                    'trace_road_id': self.trace_road_id,
+                    'temporal_info': self.temporal_info,
+                    'trace_distance_mat': self.trace_distance_mat,
+                    'trace_time_interval_mat': self.trace_time_interval_mat,
+                    'trace_len': self.trace_len,
+                    'destination_road_id': self.destination_road_id,
+                    'candidate_road_id': self.candidate_road_id,
+                    'metric_dis': self.metric_dis,
+                    'metric_angle': self.metric_angle,
+                    'candidate_len': self.candidate_len,
+                    'road_label': self.road_label,
+                    'timestamp_label': self.timestamp_label,
+                }, f, protocol=pickle.HIGHEST_PROTOCOL)
+            print(f'cached dataset saved to {cache_path}')
+
+    @staticmethod
+    def _get_cache_path(geo_file, rel_file, traj_file, cache_dir):
+        if cache_dir is None:
+            cache_dir = os.path.join(os.path.dirname(traj_file), '.cache')
+        h = hashlib.md5()
+        for path in (geo_file, rel_file, traj_file):
+            h.update(os.path.abspath(path).encode())
+            h.update(str(os.path.getmtime(path)).encode())
+        return os.path.join(cache_dir, f'dataset_{h.hexdigest()}.pkl')
 
     def __len__(self):
         return len(self.trace_road_id)

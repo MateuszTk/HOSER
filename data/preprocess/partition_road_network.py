@@ -6,7 +6,7 @@ import pandas as pd
 
 if __name__ == '__main__':
     current_directory = os.getcwd()
-    for dataset in ['Beijing', 'Porto', 'San_Francisco']:
+    for dataset in ['San_Francisco']: #'Beijing', 'Porto', 
         print(f'Processing {dataset} dataset')
 
         geo = pd.read_csv(f'../{dataset}/roadmap.geo')
@@ -32,7 +32,7 @@ if __name__ == '__main__':
                 file.write('\n')
 
         os.chdir(f'../{dataset}')
-        result = subprocess.run(f'../../KaHIP/build/kaffpa ./graph_input.tmp --k 300 --seed 0 --preconfiguration=strong --output_filename=road_network_partition', shell=True, capture_output=True, text=True)
+        result = subprocess.run(f'..\\..\\kahip\\KaHIP\\out\\build\\x64-Debug\\kaffpa.exe .\graph_input.tmp --k 300 --seed 0 --preconfiguration=strong --output_filename=road_network_partition', shell=True, capture_output=False, text=True)
         print(result.stdout)
         os.chdir(current_directory)
 
