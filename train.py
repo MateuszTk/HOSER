@@ -27,6 +27,7 @@ class MyCollateFn:
     def __init__(self, timestamp_label_log1p_mean, timestamp_label_log1p_std):
         self.timestamp_label_log1p_mean = timestamp_label_log1p_mean
         self.timestamp_label_log1p_std = timestamp_label_log1p_std
+        self.batch_counter = 0
 
     def __call__(self, items):
         batch_trace_road_id = []
@@ -57,7 +58,30 @@ class MyCollateFn:
             batch_timestamp_label.append(np.array(timestamp_label, copy=True))
 
         max_trace_len = max(batch_trace_len)
+        min_trace_len = min(batch_trace_len)
+        mean_trace_len = sum(batch_trace_len) / len(batch_trace_len)
         max_candidate_len = max([max(x) for x in batch_candidate_len])
+
+        # Statististics
+        total_trace_cells = len(batch_trace_len) * max_trace_len
+        used_trace_cells = sum(batch_trace_len)
+        trace_utilization = used_trace_cells / total_trace_cells
+
+        total_mat_cells = len(batch_trace_len) * max_trace_len * max_trace_len
+        used_mat_cells = sum(t * t for t in batch_trace_len)
+        mat_utilization = used_mat_cells / total_mat_cells
+
+        all_candidate_lens = [c for cl in batch_candidate_len for c in cl]
+        total_candidate_cells = len(batch_trace_len) * max_trace_len * max_candidate_len
+        used_candidate_cells = sum(int(c) for c in all_candidate_lens)
+        candidate_utilization = used_candidate_cells / total_candidate_cells if total_candidate_cells > 0 else 0
+
+        self.batch_counter += 1
+        # print(f"  [Batch {self.batch_counter}] samples={len(batch_trace_len)} | "
+        #       f"trace_len min={min_trace_len} mean={mean_trace_len:.1f} max={max_trace_len} | "
+        #       f"max_candidates={max_candidate_len} | "
+        #       f"utilization: seq={trace_utilization:.1%} mat={mat_utilization:.1%} cand={candidate_utilization:.1%} | "
+        #       f"est_size: mat={total_mat_cells*4*2/1024/1024:.1f}MB cand={total_candidate_cells*4*3/1024/1024:.1f}MB")
 
         for i in range(len(batch_trace_road_id)):
             trace_pad_len = max_trace_len - batch_trace_len[i]
@@ -98,6 +122,32 @@ class MyCollateFn:
         batch_timestamp_label = torch.from_numpy(np.array(batch_timestamp_label))
 
         return batch_trace_road_id, batch_temporal_info, batch_trace_distance_mat, batch_trace_time_interval_mat, batch_trace_len, batch_destination_road_id, batch_candidate_road_id, batch_metric_dis, batch_metric_angle, batch_candidate_len, batch_road_label, batch_timestamp_label
+
+
+class GroupBatchSampler:
+    def __init__(self, trace_lengths, batch_size, shuffle=True, jitter=4):
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.jitter = jitter
+        self.trace_lengths = np.array(trace_lengths)
+        self.num_samples = len(trace_lengths)
+
+    def __iter__(self):
+        if self.shuffle:
+            jittered = self.trace_lengths + np.random.randint(-self.jitter, self.jitter + 1, size=self.num_samples)
+            order = np.argsort(jittered)
+        else:
+            order = np.argsort(self.trace_lengths)
+
+        batches = [order[i:i + self.batch_size].tolist() for i in range(0, self.num_samples, self.batch_size)]
+
+        if self.shuffle:
+            np.random.shuffle(batches)
+
+        return iter(batches)
+
+    def __len__(self):
+        return (self.num_samples + self.batch_size - 1) // self.batch_size
 
 
 if __name__ == '__main__':
@@ -265,6 +315,22 @@ if __name__ == '__main__':
     train_dataset = Dataset(geo_file, rel_file, train_traj_file)
     val_dataset = Dataset(geo_file, rel_file, val_traj_file)
 
+    # histogram
+    trace_lengths = np.array(train_dataset.trace_len)
+    logger.info(f'Trace length statistics: min={trace_lengths.min()}, max={trace_lengths.max()}, '
+                f'mean={trace_lengths.mean():.1f}, median={np.median(trace_lengths):.1f}, '
+                f'std={trace_lengths.std():.1f}')
+    hist_bins = [0, 10, 20, 30, 50, 75, 100, 150, 200, 300, 500, 1000, 2000]
+    hist_counts, _ = np.histogram(trace_lengths, bins=hist_bins)
+    logger.info('Trace length histogram:')
+    for i in range(len(hist_counts)):
+        bar = '#' * int(hist_counts[i] / max(hist_counts) * 40)
+        logger.info(f'  [{hist_bins[i]:>4d}, {hist_bins[i+1]:>4d}) : {hist_counts[i]:>6d} {bar}')
+    percentiles = [50, 75, 90, 95, 99]
+    pct_values = np.percentile(trace_lengths, percentiles)
+    logger.info(f'Percentiles: ' + ', '.join(f'p{p}={int(v)}' for p, v in zip(percentiles, pct_values)))
+    del trace_lengths
+
     timestamp_label_array = []
     for item in train_dataset:
         timestamp_label_array.extend(item[11])
@@ -279,18 +345,21 @@ if __name__ == '__main__':
     logger.info(f'timestamp_label_array_log1p_mean {timestamp_label_array_log1p_mean:.3f}')
     logger.info(f'timestamp_label_array_log1p_std {timestamp_label_array_log1p_std:.3f}')
 
+    train_batch_sampler = GroupBatchSampler(
+        train_dataset.trace_len, config.optimizer_config.batch_size, shuffle=True)
+    val_batch_sampler = GroupBatchSampler(
+        val_dataset.trace_len, config.optimizer_config.batch_size, shuffle=False)
+
     train_dataloader = DataLoader(
         train_dataset,
-        config.optimizer_config.batch_size,
-        shuffle=True,
+        batch_sampler=train_batch_sampler,
         collate_fn=MyCollateFn(timestamp_label_array_log1p_mean, timestamp_label_array_log1p_std),
         num_workers=0,
         pin_memory=use_amp,
     )
     val_dataloader = DataLoader(
         val_dataset,
-        config.optimizer_config.batch_size,
-        shuffle=False,
+        batch_sampler=val_batch_sampler,
         collate_fn=MyCollateFn(timestamp_label_array_log1p_mean, timestamp_label_array_log1p_std),
         num_workers=0,
         pin_memory=use_amp,
@@ -484,10 +553,11 @@ if __name__ == '__main__':
     test_time_pred_mape_sum, test_time_pred_total_cnt = 0, 0
 
     test_dataset = Dataset(geo_file, rel_file, test_traj_file)
+    test_batch_sampler = GroupBatchSampler(
+        test_dataset.trace_len, config.optimizer_config.batch_size, shuffle=False)
     test_dataloader = DataLoader(
         test_dataset,
-        config.optimizer_config.batch_size,
-        shuffle=False,
+        batch_sampler=test_batch_sampler,
         collate_fn=MyCollateFn(timestamp_label_array_log1p_mean, timestamp_label_array_log1p_std),
         num_workers=0,
         pin_memory=use_amp,
